@@ -1,5 +1,9 @@
-from datetime import timedelta
+from datetime import timedelta, datetime
+
+from django.core.exceptions import PermissionDenied
 from django.http import HttpRequest
+from django.http.response import Http404
+
 from .inbus import inbus
 import django.contrib.auth.models
 import re
@@ -81,3 +85,51 @@ def get_client_ip_address(request: HttpRequest) -> IPAddressString | None:
         return None
     else:
         return IPAddressString(client_ip)
+
+
+def prohibit_during_test(function):
+    """
+    Decorator that restricts access to a page if the student has any ongoing exams.
+
+    The decorated function must accept the following parameters:
+        - request
+        - assignment_id
+
+    Access is granted only for tasks whose hard deadline ends before the exam starts.
+    """
+
+    def wrapper(*args, **kwargs):
+        from .models import AssignedTask
+        from .task import get_active_exams_at
+
+        request = args[0]
+
+        if is_teacher(request.user):
+            return function(*args, **kwargs)
+
+        active_exams = get_active_exams_at(request.user, datetime.now(), timedelta(0))
+
+        if not active_exams:
+            return function(*args, **kwargs)
+
+        assignment_id = kwargs.get("assignment_id")
+
+        try:
+            assignment = AssignedTask.objects.get(pk=assignment_id)
+        except AssignedTask.DoesNotExist:
+            raise Http404(f"AssignedTask with id {assignment_id} not found")
+
+        # if task is any of running exams allow it
+        is_current_exam = any(map(lambda e: e.pk == assignment.pk, active_exams))
+
+        if is_current_exam:
+            return function(*args, **kwargs)
+
+        if assignment.has_hard_deadline() and assignment.deadline is not None:
+            # check if the deadline has expired before the start of all exams
+            if all(map(lambda e: assignment.deadline < e.assigned, active_exams)):
+                return function(*args, **kwargs)
+
+        raise PermissionDenied("Access to this task is prohibited during exam")
+
+    return wrapper
